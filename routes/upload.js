@@ -8,6 +8,10 @@ let productModel = require('../schemas/products')
 let InventoryModel = require('../schemas/inventories')
 const { default: mongoose } = require('mongoose');
 var slugify = require('slugify')
+let crypto = require('crypto');
+let UserModel = require('../schemas/users');
+let RoleModel = require('../schemas/roles');
+let mailHandler = require('../utils/mailHandler');
 
 router.post('/single', uploadImage.single('file'), function (req, res, next) {
     if (!req.file) {
@@ -42,88 +46,81 @@ router.get('/:filename', function (req, res, next) {
     res.sendFile(pathFile)
 })
 
-router.post('/excel/v1', uploadExcel.single('file'), async function (req, res, next) {
+// Nhớ giữ nguyên các require ở đầu file nhé!
+
+router.post('/excel/users', uploadExcel.single('file'), async function (req, res, next) {
+    if (!req.file) {
+        return res.status(400).send({ message: "Vui lòng đính kèm file Excel (.xlsx)" });
+    }
+
     let filePath = path.join(__dirname, '../uploads', req.file.filename);
-    //workbook->n x worksheet-> n x row -> n x cell
-    let workBook = new exceljs.Workbook();
-    await workBook.xlsx.readFile(filePath);
-    let workSheet = workBook.worksheets[0];
     let errors = [];
-    let products = await productModel.find({});
-    let productTitles = products.map(e => {
-        return e.title
-    })
-    let productSkus = products.map(e => {
-        return e.sku
-    })
-    let result = []
-    for (let index = 2; index < workSheet.rowCount; index++) {
-        let rowError = []
-        let row = workSheet.getRow(index);
-        let sku = row.getCell(1).value;
-        let title = row.getCell(2).value;
-        let category = row.getCell(3).value;
-        let price = Number.parseInt(row.getCell(4).value);
-        let stock = Number.parseInt(row.getCell(5).value);
-        if (productSkus.includes(sku)) {
-            rowError.push("sku bi trung "+sku)
+    let successCount = 0;
+
+    try {
+        // 1. Lấy Role mặc định
+        let defaultRole = await RoleModel.findOne({ name: 'user' });
+        if (!defaultRole) defaultRole = await RoleModel.findOne();
+        
+        if (!defaultRole) {
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            return res.status(400).send({ message: "Hệ thống chưa có Role nào." });
         }
-        if (productTitles.includes(title)) {
-            rowError.push("title bi trung "+title)
-        }
-        if (price < 0 || isNaN(price)) {
-            rowError.push("price khong hop le:  " + row.getCell(4).value)
-        }
-        if (stock < 0 || isNaN(stock)) {
-            rowError.push("stock khong hop le " + row.getCell(5).value)
-        }
-        if (rowError.length > 0) {
-            errors.push(rowError)
-            result.push(rowError)
-        } else {
-            let session = await mongoose.startSession();
-            session.startTransaction()
+
+        // 2. Đọc file
+        let workBook = new exceljs.Workbook();
+        await workBook.xlsx.readFile(filePath);
+        let workSheet = workBook.worksheets[0];
+
+        // 3. Duyệt từng dòng (Bắt đầu từ 2)
+        for (let index = 2; index <= workSheet.rowCount; index++) {
+            let row = workSheet.getRow(index);
+
+            // TUYỆT CHIÊU: Dùng .text để ép lấy chữ hiển thị thực tế
+            let rawUsername = row.getCell(1).text; 
+            let rawEmail = row.getCell(2).text;    
+
+            // Bỏ qua dòng rỗng
+            if (!rawUsername || !rawEmail) continue;
+
+            // LÀM SẠCH TUYỆT ĐỐI: Xóa mọi dấu cách tàng hình, dấu xuống dòng, chữ mailto:
+            let username = rawUsername.toString().trim();
+            let email = rawEmail.toString().replace(/\s+/g, '').replace('mailto:', '').toLowerCase();
+
+            // IN RA TERMINAL ĐỂ KIỂM TRA (Debug)
+            console.log(`[Dòng ${index}] Chuẩn bị lưu -> User: ${username} | Email: ${email}`);
+
+            let plainPassword = crypto.randomBytes(8).toString('hex');
+
             try {
-                let newItem = new productModel({
-                    sku: sku,
-                    title: title,
-                    slug: slugify(title, {
-                        replacement: '-',
-                        remove: undefined,
-                        lower: false,
-                        strict: false,
-                        locale: 'vi'
-                    }),
-                    price: price,
-                    description: title,
-                    category: category
-                })
-                //replica set
-                let newProduct = await newItem.save({ session });
-                console.log(newProduct);
-                let newInventory = new InventoryModel({
-                    product: newProduct._id,
-                    stock: stock
-                })
-                newInventory = await newInventory.save({ session });
-                await newInventory.populate('product')
-                await session.commitTransaction()
-                await session.endSession()
-                productTitles.push(title);
-                productSkus.push(sku)
-                result.push(newInventory)
-                //res.send(newInventory);
-            } catch (errorCreate) {
-                await session.abortTransaction()
-                await session.endSession();
-                errors.push(errorCreate.message)
-                result.push(errorCreate.message)
+                let newUser = new UserModel({
+                    username: username,
+                    email: email,
+                    password: plainPassword,
+                    role: defaultRole._id
+                });
+
+                await newUser.save();
+                await mailHandler.sendNewAccountMail(email, username, plainPassword);
+                successCount++;
+            } catch (err) {
+                console.error(`Lỗi Mongoose dòng ${index}:`, err.message);
+                errors.push(`Dòng ${index} (${username}): ${err.message}`);
             }
         }
-    }
-    res.send(result);
-    fs.unlinkSync(filePath)
 
-})
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+        res.status(200).send({
+            message: `Import hoàn tất. Thành công: ${successCount} users.`,
+            errors: errors.length > 0 ? errors : "Không có lỗi nào."
+        });
+
+    } catch (error) {
+        console.error("Lỗi hệ thống:", error);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        res.status(500).send({ message: "Có lỗi khi đọc file.", error: error.message });
+    }
+});
 
 module.exports = router;
